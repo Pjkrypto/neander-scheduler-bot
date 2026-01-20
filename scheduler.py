@@ -44,6 +44,9 @@ STATE_PATH = os.getenv("SCHEDULER_STATE_PATH", "/opt/bot-state/scheduler_state.j
 
 MAX_TRAITS = int(os.getenv("MAX_TRAITS", "50"))
 
+# Whether to include an estimated count based on minted_so_far (ex: "7 (3.21%)")
+SHOW_TRAIT_COUNTS = os.getenv("SHOW_TRAIT_COUNTS", "false").strip().lower() in ("1", "true", "yes", "y", "on")
+
 if not SCHEDULER_BOT_TOKEN:
     raise SystemExit("Missing SCHEDULER_BOT_TOKEN")
 if not AUTOPOST_CHAT_ID:
@@ -91,6 +94,56 @@ def _display_nft_id(contract: str, token_id: int) -> int:
     return token_id + DISPLAY_ID_OFFSETS.get(c, 0)
 
 
+def _norm(s: Any) -> str:
+    return str(s).strip().casefold()
+
+
+def _prevalence_to_pct(prevalence: Any) -> Optional[float]:
+    try:
+        p = float(prevalence)
+    except Exception:
+        return None
+    # Some responses return 0..1, others 0..100
+    return p * 100.0 if p <= 1.0 else p
+
+
+def _build_trait_pct_map_from_alchemy(rarity_resp: Dict[str, Any]) -> Dict[Tuple[str, str], float]:
+    out: Dict[Tuple[str, str], float] = {}
+    rarities = rarity_resp.get("rarities")
+    if not isinstance(rarities, list):
+        return out
+
+    for item in rarities:
+        if not isinstance(item, dict):
+            continue
+
+        tt = item.get("trait_type") or item.get("traitType") or item.get("key") or item.get("trait")
+        vv = item.get("value")
+        if tt is None or vv is None:
+            continue
+
+        pct = _prevalence_to_pct(item.get("prevalence") or item.get("frequency") or item.get("pct"))
+        if pct is None:
+            continue
+
+        out[(_norm(tt), _norm(vv))] = pct
+
+    return out
+
+
+def _format_trait_line(trait_type: str, value: str, pct: Optional[float], minted_so_far: Optional[int]) -> str:
+    if pct is None:
+        return f"{trait_type}: {value} — n/a"
+
+    pct_str = f"{pct:.2f}%"
+
+    if SHOW_TRAIT_COUNTS and minted_so_far and minted_so_far > 0:
+        est = int(round((pct / 100.0) * minted_so_far))
+        return f"{trait_type}: {value} — {est} ({pct_str})"
+
+    return f"{trait_type}: {value} — {pct_str}"
+
+
 async def _get_json(
     url: str,
     params: Optional[Dict[str, Any]] = None,
@@ -100,6 +153,7 @@ async def _get_json(
     h = {"accept": "application/json"}
     if headers:
         h.update(headers)
+
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.get(url, params=params, headers=h)
@@ -120,6 +174,9 @@ async def _get_json(
         return None, "Could not parse JSON"
 
 
+# -----------------------
+# ALCHEMY
+# -----------------------
 async def fetch_minted_so_far_alchemy(contract: str) -> Tuple[Optional[int], Optional[str]]:
     url = f"{_alchemy_root()}/getContractMetadata"
     params = {"contractAddress": contract}
@@ -133,6 +190,12 @@ async def fetch_minted_so_far_alchemy(contract: str) -> Tuple[Optional[int], Opt
 async def fetch_nft_metadata_alchemy(contract: str, token_id: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     url = f"{_alchemy_root()}/getNFTMetadata"
     params = {"contractAddress": contract, "tokenId": str(token_id), "refreshCache": "false"}
+    return await _get_json(url, params=params)
+
+
+async def fetch_compute_rarity_alchemy(contract: str, token_id: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    url = f"{_alchemy_root()}/computeRarity"
+    params = {"contractAddress": contract, "tokenId": str(token_id)}
     return await _get_json(url, params=params)
 
 
@@ -165,6 +228,9 @@ def _extract_traits(meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
+# -----------------------
+# OPENSEA
+# -----------------------
 async def fetch_opensea_rank(contract: str, token_id: int) -> Tuple[Optional[int], Optional[str]]:
     url = f"https://api.opensea.io/api/v2/chain/{CHAIN}/contract/{contract}/nfts/{token_id}"
     headers = {
@@ -175,16 +241,19 @@ async def fetch_opensea_rank(contract: str, token_id: int) -> Tuple[Optional[int
     data, err = await _get_json(url, headers=headers, timeout=25.0)
     if err:
         return None, err
+
     nft = data.get("nft") if isinstance(data, dict) else None
     if not isinstance(nft, dict):
         nft = data if isinstance(data, dict) else None
     if not isinstance(nft, dict):
         return None, "Unexpected OpenSea response"
+
     rarity = nft.get("rarity")
     if isinstance(rarity, dict):
         rank = _safe_int(rarity.get("rank"))
         if rank is not None:
             return rank, None
+
     rank = _safe_int(nft.get("rarity_rank") or nft.get("rarityRank"))
     return rank, None
 
@@ -199,6 +268,9 @@ async def _download_image_bytes(url: str) -> Optional[bytes]:
         return None
 
 
+# -----------------------
+# STATE
+# -----------------------
 def _load_state() -> Dict[str, Any]:
     try:
         with open(STATE_PATH, "r") as f:
@@ -279,6 +351,9 @@ async def _get_cached_supply(contract: str) -> Optional[int]:
     return int(supply)
 
 
+# -----------------------
+# POST BUILD
+# -----------------------
 async def _build_post(contract: str, token_id: int) -> Tuple[Optional[str], Optional[bytes], Optional[str]]:
     meta, err = await fetch_nft_metadata_alchemy(contract, token_id)
     if err or not isinstance(meta, dict):
@@ -286,6 +361,12 @@ async def _build_post(contract: str, token_id: int) -> Tuple[Optional[str], Opti
 
     minted_so_far = await _get_cached_supply(contract)
     os_rank, _ = await fetch_opensea_rank(contract, token_id)
+
+    # Trait % map from Alchemy computeRarity (best-effort; do not fail the post if it errors)
+    rarity_resp, r_err = await fetch_compute_rarity_alchemy(contract, token_id)
+    trait_pct_map: Dict[Tuple[str, str], float] = {}
+    if not r_err and isinstance(rarity_resp, dict):
+        trait_pct_map = _build_trait_pct_map_from_alchemy(rarity_resp)
 
     coll = _collection_label(contract)
     nft_id = _display_nft_id(contract, token_id)
@@ -296,13 +377,15 @@ async def _build_post(contract: str, token_id: int) -> Tuple[Optional[str], Opti
         header2 += f" of {minted_so_far}"
 
     traits = _extract_traits(meta or {})
-    trait_lines = []
+    trait_lines: List[str] = []
     for a in traits[:MAX_TRAITS]:
         tt = a.get("trait_type") or a.get("type") or a.get("traitType") or "Trait"
         vv = a.get("value")
         if not isinstance(tt, str) or vv is None:
             continue
-        trait_lines.append(f"{tt}: {vv}")
+        vv_s = str(vv)
+        pct = trait_pct_map.get((_norm(tt), _norm(vv_s)))
+        trait_lines.append(_format_trait_line(tt, vv_s, pct, minted_so_far))
 
     rarity_lines = ["<b>Rarity (OpenSea)</b>"]
     rarity_lines.append(f"Rank: #{os_rank}" if os_rank is not None else "Rank not available")
@@ -323,6 +406,9 @@ async def _build_post(contract: str, token_id: int) -> Tuple[Optional[str], Opti
     return caption, img_bytes, None
 
 
+# -----------------------
+# TELEGRAM SEND
+# -----------------------
 async def _telegram_send_photo_or_message(caption: str, img_bytes: Optional[bytes]) -> Tuple[bool, str]:
     base = f"https://api.telegram.org/bot{SCHEDULER_BOT_TOKEN}"
     try:
@@ -351,6 +437,9 @@ async def _telegram_send_photo_or_message(caption: str, img_bytes: Optional[byte
         return False, f"Telegram send failed: {e}"
 
 
+# -----------------------
+# MAIN LOOP
+# -----------------------
 async def run_forever() -> None:
     while True:
         now_ts = time.time()
@@ -396,10 +485,10 @@ async def run_forever() -> None:
                 post_times.append(now_ts)
                 state["autopost_times"] = post_times
                 _save_state(state)
+            # If failed, we just wait and try later (no counter increment)
 
         await asyncio.sleep(random.randint(MIN_MINUTES * 60, MAX_MINUTES * 60))
 
 
 if __name__ == "__main__":
     asyncio.run(run_forever())
-
