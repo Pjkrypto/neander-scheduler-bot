@@ -1,5 +1,4 @@
 import os
-import io
 import json
 import time
 import random
@@ -12,7 +11,7 @@ import httpx
 # ENV
 # -----------------------
 SCHEDULER_BOT_TOKEN = os.getenv("SCHEDULER_BOT_TOKEN", "").strip()
-AUTOPOST_CHAT_ID = os.getenv("AUTOPOST_CHAT_ID", "").strip()  # @NeanderBros or numeric chat id
+AUTOPOST_CHAT_ID = os.getenv("AUTOPOST_CHAT_ID", "").strip()  # @channelusername OR numeric chat id
 
 CHAIN = os.getenv("CHAIN", "polygon").strip()
 
@@ -28,8 +27,16 @@ OPENSEA_API_KEY = os.getenv("OPENSEA_API_KEY", "").strip()
 BRO_WEIGHT = float(os.getenv("BRO_WEIGHT", "0.80"))
 GAL_WEIGHT = float(os.getenv("GAL_WEIGHT", "0.20"))
 
+# Rolling cap
 MAX_POSTS_PER_24H = int(os.getenv("AUTOPOST_MAX_POSTS_PER_24H", "10"))
 WINDOW_HOURS = int(os.getenv("AUTOPOST_WINDOW_HOURS", "24"))
+
+# Even spacing + minimum gap
+SCHEDULER_JITTER_PCT = float(os.getenv("SCHEDULER_JITTER_PCT", "0.40"))
+SCHEDULER_MIN_GAP_MINUTES = int(os.getenv("SCHEDULER_MIN_GAP_MINUTES", "120"))
+
+# Backoff if APIs fail
+FAIL_BACKOFF_MINUTES = int(os.getenv("FAIL_BACKOFF_MINUTES", "15"))
 
 BROS_MIN_TOKEN_ID = int(os.getenv("BROS_MIN_TOKEN_ID", "1"))
 GALS_MIN_TOKEN_ID = int(os.getenv("GALS_MIN_TOKEN_ID", "0"))
@@ -39,13 +46,6 @@ RANDOM_PICK_RETRIES = int(os.getenv("RANDOM_PICK_RETRIES", "6"))
 
 STATE_PATH = os.getenv("SCHEDULER_STATE_PATH", "/opt/bot-state/scheduler_state.json").strip()
 MAX_TRAITS = int(os.getenv("MAX_TRAITS", "50"))
-
-# New: global 24/7 spreading controls
-SCHEDULER_JITTER_PCT = float(os.getenv("SCHEDULER_JITTER_PCT", "0.40"))  # 0.00 - 1.00
-SCHEDULER_MIN_GAP_MINUTES = int(os.getenv("SCHEDULER_MIN_GAP_MINUTES", "90"))
-
-# If APIs are flaky, wait this long before trying again
-FAIL_BACKOFF_MINUTES = int(os.getenv("FAIL_BACKOFF_MINUTES", "15"))
 
 if not SCHEDULER_BOT_TOKEN:
     raise SystemExit("Missing SCHEDULER_BOT_TOKEN")
@@ -61,6 +61,10 @@ if not BROS or not GALS:
 DISPLAY_ID_OFFSETS = {BROS: 1, GALS: 0}
 
 
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
 def _alchemy_root() -> str:
     if ALCHEMY_BASE_URL:
         return f"{ALCHEMY_BASE_URL}/nft/v3/{ALCHEMY_API_KEY}"
@@ -71,9 +75,26 @@ def _safe_int(v: Any) -> Optional[int]:
     try:
         if v is None or isinstance(v, bool):
             return None
-        return int(str(v), 0) if isinstance(v, str) and v.strip().lower().startswith("0x") else int(str(v))
+        s = str(v).strip()
+        if s.lower().startswith("0x"):
+            return int(s, 16)
+        return int(s)
     except Exception:
         return None
+
+
+def _norm(s: Any) -> str:
+    return str(s).strip().casefold()
+
+
+def _prevalence_to_pct(prevalence: Any) -> Optional[float]:
+    try:
+        p = float(prevalence)
+    except Exception:
+        return None
+    if p <= 1.0:
+        return p * 100.0
+    return p
 
 
 def _opensea_url(contract: str, token_id: int) -> str:
@@ -94,32 +115,80 @@ def _display_nft_id(contract: str, token_id: int) -> int:
     return token_id + DISPLAY_ID_OFFSETS.get(c, 0)
 
 
-def _norm(s: Any) -> str:
-    return str(s).strip().casefold()
-
-
-def _prevalence_to_pct(prevalence: Any) -> Optional[float]:
+# -----------------------
+# STATE
+# -----------------------
+def _load_state() -> Dict[str, Any]:
     try:
-        p = float(prevalence)
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
     except Exception:
-        return None
-    if p <= 1.0:
-        return p * 100.0
-    return p
+        return {}
+
+
+def _save_state(state: Dict[str, Any]) -> None:
+    folder = os.path.dirname(STATE_PATH) or "."
+    os.makedirs(folder, exist_ok=True)
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE_PATH)
+
+
+def _prune_old_post_times(post_times: List[float], now_ts: float) -> List[float]:
+    cutoff = now_ts - (WINDOW_HOURS * 3600)
+    return [t for t in post_times if t >= cutoff]
+
+
+def _seconds_until_cap_clears(post_times: List[float], now_ts: float) -> int:
+    oldest = min(post_times)
+    window_seconds = WINDOW_HOURS * 3600
+    return max(60, int((oldest + window_seconds) - now_ts))
+
+
+def _compute_next_delay_seconds() -> int:
+    base = int((WINDOW_HOURS * 3600) / max(1, MAX_POSTS_PER_24H))
+    jitter = max(0.0, min(SCHEDULER_JITTER_PCT, 0.95))
+    factor = 1.0 + random.uniform(-jitter, jitter)
+    proposed = int(base * factor)
+    min_gap = max(60, SCHEDULER_MIN_GAP_MINUTES * 60)
+    return max(proposed, min_gap)
+
+
+# -----------------------
+# HTTP (single shared client)
+# -----------------------
+DEFAULT_HEADERS = {
+    "accept": "application/json",
+    "user-agent": "Mozilla/5.0 (compatible; NeanderSchedulerBot/1.0)",
+}
+
+_client: Optional[httpx.AsyncClient] = None
+
+
+async def get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        timeout = httpx.Timeout(connect=15.0, read=25.0, write=25.0, pool=15.0)
+        _client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=DEFAULT_HEADERS)
+    return _client
 
 
 async def _get_json(
     url: str,
     params: Optional[Dict[str, Any]] = None,
     headers: Optional[Dict[str, str]] = None,
-    timeout: float = 25.0,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    h = {"accept": "application/json"}
+    h = dict(DEFAULT_HEADERS)
     if headers:
         h.update(headers)
+
     try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            r = await client.get(url, params=params, headers=h)
+        client = await get_client()
+        r = await client.get(url, params=params, headers=h)
     except Exception as e:
         return None, f"Network error calling API: {e}"
 
@@ -128,26 +197,36 @@ async def _get_json(
     if r.status_code in (401, 403):
         return None, f"API auth error ({r.status_code})."
     if r.status_code >= 400:
-        return None, f"API error {r.status_code}: {r.text[:200]}"
+        return None, f"API error {r.status_code}: {(r.text or '')[:200]}"
 
     try:
         data = r.json()
-        return data if isinstance(data, dict) else None, None if isinstance(data, dict) else "Bad JSON shape"
+        if isinstance(data, dict):
+            return data, None
+        return None, "Bad JSON shape"
     except Exception:
         return None, "Could not parse JSON"
 
 
+async def _download_bytes(url: str) -> Optional[bytes]:
+    try:
+        client = await get_client()
+        r = await client.get(url, headers={"accept": "*/*"})
+        r.raise_for_status()
+        return r.content
+    except Exception:
+        return None
+
+
 # -----------------------
-# ALCHEMY
+# API calls
 # -----------------------
 async def fetch_minted_so_far_alchemy(contract: str) -> Tuple[Optional[int], Optional[str]]:
     url = f"{_alchemy_root()}/getContractMetadata"
-    params = {"contractAddress": contract}
-    data, err = await _get_json(url, params=params)
+    data, err = await _get_json(url, params={"contractAddress": contract})
     if err:
         return None, err
-    minted = _safe_int((data or {}).get("totalSupply"))
-    return minted, None
+    return _safe_int((data or {}).get("totalSupply")), None
 
 
 async def fetch_nft_metadata_alchemy(contract: str, token_id: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -208,38 +287,28 @@ def _build_trait_pct_map_from_alchemy(rarity_resp: Dict[str, Any]) -> Dict[Tuple
         if pct is None:
             continue
         out[(_norm(tt), _norm(vv))] = pct
-
     return out
 
 
-async def _download_image_bytes(url: str) -> Optional[bytes]:
-    try:
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
-            r = await client.get(url, headers={"user-agent": "Mozilla/5.0 (compatible; NeanderSchedulerBot/1.0)"})
-            r.raise_for_status()
-            return r.content
-    except Exception:
-        return None
+def _format_trait_line(trait_type: str, value: str, pct: Optional[float]) -> str:
+    if pct is None:
+        return f"{trait_type}: {value} — n/a"
+    return f"{trait_type}: {value} — {pct:.2f}%"
 
 
-# -----------------------
-# OPENSEA
-# -----------------------
 async def fetch_opensea_rank(contract: str, token_id: int) -> Tuple[Optional[int], Optional[str]]:
     url = f"https://api.opensea.io/api/v2/chain/{CHAIN}/contract/{contract}/nfts/{token_id}"
-    headers = {
-        "accept": "application/json",
-        "x-api-key": OPENSEA_API_KEY,
-        "user-agent": "Mozilla/5.0 (compatible; NeanderSchedulerBot/1.0)",
-    }
-    data, err = await _get_json(url, headers=headers, timeout=25.0)
+    headers = {"x-api-key": OPENSEA_API_KEY}
+    data, err = await _get_json(url, headers=headers)
     if err:
         return None, err
+
     nft = data.get("nft") if isinstance(data, dict) else None
     if not isinstance(nft, dict):
         nft = data if isinstance(data, dict) else None
     if not isinstance(nft, dict):
         return None, "Unexpected OpenSea response"
+
     rarity = nft.get("rarity")
     if isinstance(rarity, dict):
         rank = _safe_int(rarity.get("rank"))
@@ -247,60 +316,6 @@ async def fetch_opensea_rank(contract: str, token_id: int) -> Tuple[Optional[int
             return rank, None
     rank = _safe_int(nft.get("rarity_rank") or nft.get("rarityRank"))
     return rank, None
-
-
-# -----------------------
-# STATE
-# -----------------------
-def _load_state() -> Dict[str, Any]:
-    try:
-        with open(STATE_PATH, "r") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        return {}
-
-
-def _save_state(state: Dict[str, Any]) -> None:
-    folder = os.path.dirname(STATE_PATH) or "."
-    os.makedirs(folder, exist_ok=True)
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f)
-    os.replace(tmp, STATE_PATH)
-
-
-def _prune_old_post_times(post_times: List[float], now_ts: float) -> List[float]:
-    cutoff = now_ts - (WINDOW_HOURS * 3600)
-    return [t for t in post_times if t >= cutoff]
-
-
-def _next_delay_if_capped(post_times: List[float], now_ts: float) -> int:
-    post_times_sorted = sorted(post_times)
-    oldest = post_times_sorted[0]
-    window_seconds = WINDOW_HOURS * 3600
-    seconds_until_allowed = int((oldest + window_seconds) - now_ts)
-    jitter = random.randint(60, 10 * 60)
-    return max(60, seconds_until_allowed + jitter)
-
-
-def _choose_collection_weighted() -> str:
-    return random.choices(
-        population=["bro", "gal"],
-        weights=[max(BRO_WEIGHT, 0.0), max(GAL_WEIGHT, 0.0)],
-        k=1,
-    )[0]
-
-
-def _min_token_id_for(contract: str) -> int:
-    c = (contract or "").lower()
-    if c == BROS:
-        return BROS_MIN_TOKEN_ID
-    if c == GALS:
-        return GALS_MIN_TOKEN_ID
-    return 0
 
 
 async def _get_cached_supply(contract: str) -> Optional[int]:
@@ -332,77 +347,17 @@ async def _get_cached_supply(contract: str) -> Optional[int]:
     return int(supply)
 
 
-# -----------------------
-# SCHEDULING (24/7 spread, restart-safe)
-# -----------------------
-def _base_interval_seconds() -> int:
-    posts_per_day = max(1, MAX_POSTS_PER_24H)
-    return int((24 * 3600) / posts_per_day)
-
-
-def _schedule_next_run(now_ts: float) -> float:
-    """
-    Even spacing across 24h with jitter + minimum gap.
-    Stores a concrete 'next_run_ts' so restarts do not cause bursts.
-    """
-    base = _base_interval_seconds()
-
-    jitter_pct = max(0.0, min(SCHEDULER_JITTER_PCT, 1.0))
-    jitter = int(base * jitter_pct)
-
-    low = max(60, base - jitter)
-    high = base + jitter
-
-    delay = random.randint(low, high)
-
-    min_gap = max(60, SCHEDULER_MIN_GAP_MINUTES * 60)
-    delay = max(delay, min_gap)
-
-    return now_ts + delay
-
-
-def _get_or_init_next_run(state: Dict[str, Any], now_ts: float) -> float:
-    """
-    If next_run_ts exists and is in the future, keep it.
-    If missing or stale, initialize a new schedule (not immediate).
-    """
-    nxt = state.get("next_run_ts")
-    try:
-        nxt_f = float(nxt)
-    except Exception:
-        nxt_f = 0.0
-
-    # If it's already scheduled in the future, respect it
-    if nxt_f > now_ts:
-        return nxt_f
-
-    # If missing/expired, schedule a new one (not "right now")
-    nxt_f = _schedule_next_run(now_ts)
-    state["next_run_ts"] = nxt_f
-    _save_state(state)
-    return nxt_f
-
-
-def _set_next_run(state: Dict[str, Any], next_ts: float) -> None:
-    state["next_run_ts"] = float(next_ts)
-    _save_state(state)
-
-
-# -----------------------
-# POST BUILD (with trait %)
-# -----------------------
 async def _build_post(contract: str, token_id: int) -> Tuple[Optional[str], Optional[bytes], Optional[str]]:
     meta, err = await fetch_nft_metadata_alchemy(contract, token_id)
     if err or not isinstance(meta, dict):
         return None, None, err or "Metadata not available"
-
-    minted_so_far = await _get_cached_supply(contract)
 
     rarity_resp, r_err = await fetch_compute_rarity_alchemy(contract, token_id)
     trait_pct_map: Dict[Tuple[str, str], float] = {}
     if not r_err and isinstance(rarity_resp, dict):
         trait_pct_map = _build_trait_pct_map_from_alchemy(rarity_resp)
 
+    minted_so_far = await _get_cached_supply(contract)
     os_rank, _ = await fetch_opensea_rank(contract, token_id)
 
     coll = _collection_label(contract)
@@ -413,19 +368,16 @@ async def _build_post(contract: str, token_id: int) -> Tuple[Optional[str], Opti
     if minted_so_far and minted_so_far > 0:
         header2 += f" of {minted_so_far}"
 
-    traits = _extract_traits(meta or {})
-    trait_lines = []
+    traits = _extract_traits(meta)
+    trait_lines: List[str] = []
     for a in traits[:MAX_TRAITS]:
         tt = a.get("trait_type") or a.get("type") or a.get("traitType") or "Trait"
         vv = a.get("value")
         if not isinstance(tt, str) or vv is None:
             continue
-
-        pct = trait_pct_map.get((_norm(tt), _norm(str(vv))))
-        if pct is None:
-            trait_lines.append(f"{tt}: {vv}")
-        else:
-            trait_lines.append(f"{tt}: {vv} — {pct:.2f}%")
+        vv_s = str(vv)
+        pct = trait_pct_map.get((_norm(tt), _norm(vv_s)))
+        trait_lines.append(_format_trait_line(tt, vv_s, pct))
 
     rarity_lines = ["<b>Rarity (OpenSea)</b>"]
     rarity_lines.append(f"Rank: #{os_rank}" if os_rank is not None else "Rank not available")
@@ -441,109 +393,176 @@ async def _build_post(contract: str, token_id: int) -> Tuple[Optional[str], Opti
         f"<a href=\"{os_url}\">View on OpenSea</a>"
     )
 
-    image_url = _pick_image_url(meta or {})
-    img_bytes = await _download_image_bytes(image_url) if image_url else None
+    image_url = _pick_image_url(meta)
+    img_bytes = await _download_bytes(image_url) if image_url else None
     return caption, img_bytes, None
 
 
+# -----------------------
+# Telegram send
+# -----------------------
 async def _telegram_send_photo_or_message(caption: str, img_bytes: Optional[bytes]) -> Tuple[bool, str]:
     base = f"https://api.telegram.org/bot{SCHEDULER_BOT_TOKEN}"
     try:
-        async with httpx.AsyncClient(timeout=45, follow_redirects=True) as client:
-            if img_bytes:
-                files = {"photo": ("nft.png", img_bytes, "image/png")}
-                data = {
-                    "chat_id": AUTOPOST_CHAT_ID,
-                    "caption": caption,
-                    "parse_mode": "HTML",
-                }
-                r = await client.post(f"{base}/sendPhoto", data=data, files=files)
-            else:
-                data = {
-                    "chat_id": AUTOPOST_CHAT_ID,
-                    "text": caption,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                }
-                r = await client.post(f"{base}/sendMessage", data=data)
+        client = await get_client()
+
+        if img_bytes:
+            files = {"photo": ("nft.png", img_bytes, "image/png")}
+            data = {"chat_id": AUTOPOST_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
+            r = await client.post(f"{base}/sendPhoto", data=data, files=files)
+        else:
+            data = {
+                "chat_id": AUTOPOST_CHAT_ID,
+                "text": caption,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+            r = await client.post(f"{base}/sendMessage", data=data)
 
         if r.status_code >= 400:
-            return False, f"Telegram API error {r.status_code}: {r.text[:200]}"
+            return False, f"Telegram API error {r.status_code}: {(r.text or '')[:400]}"
         return True, "ok"
     except Exception as e:
         return False, f"Telegram send failed: {e}"
 
 
-# -----------------------
-# MAIN LOOP
-# -----------------------
+async def _startup_test_once() -> None:
+    state = _load_state()
+    if state.get("startup_test_sent") is True:
+        return
+
+    msg = (
+        "<b>Neander Scheduler Bot</b> is online.\n"
+        "If you see this message, the bot has permission to post to this chat."
+    )
+    ok, resp = await _telegram_send_photo_or_message(msg, None)
+    if ok:
+        state["startup_test_sent"] = True
+        _save_state(state)
+        log("Startup test message sent successfully (and marked as sent).")
+    else:
+        log(f"Startup test FAILED: {resp}")
+
+
+def _choose_collection_weighted() -> str:
+    return random.choices(
+        population=["bro", "gal"],
+        weights=[max(BRO_WEIGHT, 0.0), max(GAL_WEIGHT, 0.0)],
+        k=1,
+    )[0]
+
+
+def _min_token_id_for(contract: str) -> int:
+    c = (contract or "").lower()
+    if c == BROS:
+        return BROS_MIN_TOKEN_ID
+    if c == GALS:
+        return GALS_MIN_TOKEN_ID
+    return 0
+
+
 async def run_forever() -> None:
+    log("Scheduler starting...")
+    log(
+        f"AUTOPOST_CHAT_ID={AUTOPOST_CHAT_ID!r} CHAIN={CHAIN} "
+        f"CAP={MAX_POSTS_PER_24H}/{WINDOW_HOURS}h "
+        f"JITTER={SCHEDULER_JITTER_PCT} MIN_GAP_MIN={SCHEDULER_MIN_GAP_MINUTES} "
+        f"FAIL_BACKOFF_MIN={FAIL_BACKOFF_MINUTES}"
+    )
+
+    await _startup_test_once()
+
     while True:
-        now_ts = time.time()
-        state = _load_state()
+        try:
+            now_ts = time.time()
+            state = _load_state()
 
-        # Rolling cap tracking
-        post_times = state.get("autopost_times", [])
-        if not isinstance(post_times, list):
-            post_times = []
-        post_times = [float(t) for t in post_times if isinstance(t, (int, float))]
-        post_times = _prune_old_post_times(post_times, now_ts)
+            post_times = state.get("autopost_times", [])
+            if not isinstance(post_times, list):
+                post_times = []
+            post_times = [float(t) for t in post_times if isinstance(t, (int, float))]
+            post_times = _prune_old_post_times(post_times, now_ts)
 
-        # If capped, sleep until allowed, and also schedule next_run_ts to avoid bursts
-        if len(post_times) >= MAX_POSTS_PER_24H:
-            state["autopost_times"] = post_times
-            _save_state(state)
-
-            delay = _next_delay_if_capped(post_times, now_ts)
-            # Ensure next_run_ts is at least after the cap clears
-            _set_next_run(state, now_ts + delay)
-            await asyncio.sleep(delay)
-            continue
-
-        # Respect persistent next_run_ts (restart-safe anti-burst)
-        next_run_ts = _get_or_init_next_run(state, now_ts)
-        if next_run_ts > now_ts:
-            await asyncio.sleep(int(next_run_ts - now_ts))
-            continue
-
-        # Attempt a post
-        choice = _choose_collection_weighted()
-        contract = BROS if choice == "bro" else GALS
-
-        supply = await _get_cached_supply(contract)
-        min_id = _min_token_id_for(contract)
-
-        if supply is None or supply <= min_id:
-            # API/data not ready; backoff but keep distribution sane
-            backoff = max(60, FAIL_BACKOFF_MINUTES * 60)
-            _set_next_run(state, now_ts + backoff)
-            await asyncio.sleep(backoff)
-            continue
-
-        caption = None
-        img = None
-
-        for _ in range(max(1, RANDOM_PICK_RETRIES)):
-            token_id = random.randint(min_id, supply - 1) if supply > (min_id + 1) else min_id
-            cap, im, err = await _build_post(contract, token_id)
-            if err:
+            # enforce min gap since last successful post
+            last_post_ts = float(state.get("last_post_ts") or 0.0)
+            min_gap_sec = max(60, SCHEDULER_MIN_GAP_MINUTES * 60)
+            if last_post_ts > 0 and (now_ts - last_post_ts) < min_gap_sec:
+                wait = int(min_gap_sec - (now_ts - last_post_ts))
+                log(f"MIN-GAP: waiting {wait}s before next post attempt.")
+                await asyncio.sleep(wait)
                 continue
-            caption, img = cap, im
-            break
 
-        if caption:
-            ok, _msg = await _telegram_send_photo_or_message(caption, img)
-            if ok:
-                post_times.append(time.time())
+            # rolling cap
+            if len(post_times) >= MAX_POSTS_PER_24H:
+                wait = _seconds_until_cap_clears(post_times, now_ts) + random.randint(60, 10 * 60)
                 state["autopost_times"] = post_times
                 _save_state(state)
+                log(f"CAPPED: {len(post_times)}/{MAX_POSTS_PER_24H}. Sleeping {wait}s.")
+                await asyncio.sleep(wait)
+                continue
 
-        # Schedule the next run across the 24/7 window (even + jitter), persist it
-        now_ts2 = time.time()
-        next_ts = _schedule_next_run(now_ts2)
-        _set_next_run(state, next_ts)
-        await asyncio.sleep(max(1, int(next_ts - now_ts2)))
+            choice = _choose_collection_weighted()
+            contract = BROS if choice == "bro" else GALS
+
+            supply = await _get_cached_supply(contract)
+            min_id = _min_token_id_for(contract)
+            if supply is None or supply <= min_id:
+                wait = FAIL_BACKOFF_MINUTES * 60
+                log(f"Supply unavailable (contract={choice}). Sleeping {wait}s.")
+                await asyncio.sleep(wait)
+                continue
+
+            caption: Optional[str] = None
+            img: Optional[bytes] = None
+            picked_token: Optional[int] = None
+
+            # Try random tokenIds until metadata resolves
+            for _ in range(max(1, RANDOM_PICK_RETRIES)):
+                token_id = random.randint(min_id, max(min_id, supply - 1))
+                cap, im, err = await _build_post(contract, token_id)
+                if err:
+                    continue
+                caption, img, picked_token = cap, im, token_id
+                break
+
+            if not caption:
+                wait = FAIL_BACKOFF_MINUTES * 60
+                log(f"Failed to build post after retries. Sleeping {wait}s.")
+                await asyncio.sleep(wait)
+                continue
+
+            ok, resp = await _telegram_send_photo_or_message(caption, img)
+            if ok:
+                post_times.append(now_ts)
+                state["autopost_times"] = post_times
+                state["last_post_ts"] = now_ts
+                _save_state(state)
+                log(f"POSTED ok: {choice} tokenId={picked_token} total_in_window={len(post_times)}/{MAX_POSTS_PER_24H}")
+            else:
+                log(f"POST FAILED: {choice} tokenId={picked_token} reason={resp}")
+                await asyncio.sleep(FAIL_BACKOFF_MINUTES * 60)
+                continue
+
+            delay = _compute_next_delay_seconds()
+            log(f"Next attempt in {delay}s.")
+            await asyncio.sleep(delay)
+
+        except Exception as e:
+            log(f"FATAL LOOP ERROR (continuing): {e}")
+            await asyncio.sleep(30)
+
+
+async def _shutdown() -> None:
+    global _client
+    if _client and not _client.is_closed:
+        await _client.aclose()
 
 
 if __name__ == "__main__":
-    asyncio.run(run_forever())
+    try:
+        asyncio.run(run_forever())
+    finally:
+        try:
+            asyncio.run(_shutdown())
+        except Exception:
+            pass
